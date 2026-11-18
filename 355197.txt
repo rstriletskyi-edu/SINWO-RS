@@ -1,3 +1,0 @@
-Something from original 
-Something from copy
-Something from branch
