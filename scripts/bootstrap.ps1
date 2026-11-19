@@ -4,11 +4,11 @@
   Creates the SINWO Azure footprint and the GitHub dev and prod environments.
 
 .DESCRIPTION
-  Deploys infra/main.bicep into rg-sinwo-cicd, then stores the ACR admin
-  credentials as repository secrets and the per-environment backend URLs as
-  GitHub environment variables. Phase 1 uses the ACR admin user because the
-  university tenant blocks Entra app registrations. The script does not print
-  the registry password.
+  Deploys infra/main.bicep into rg-sinwo-cicd, then stores GitHub environment
+  variables and the OIDC identifiers the workflow uses. ACR admin credentials
+  stay as repository secrets for a manual fallback. The script does not print
+  the registry password. Rerunning resets each app to its *-latest image tag
+  and APP_VERSION=*-latest. Those tags still point at the last pushed image.
 
 .PARAMETER ResourceGroupName
   Resource group to create or update. Default: rg-sinwo-cicd.
@@ -111,6 +111,7 @@ try {
     Invoke-Checked { az provider register --namespace Microsoft.App --wait } "Failed to register Microsoft.App."
     Invoke-Checked { az provider register --namespace Microsoft.OperationalInsights --wait } "Failed to register Microsoft.OperationalInsights."
     Invoke-Checked { az provider register --namespace Microsoft.ContainerRegistry --wait } "Failed to register Microsoft.ContainerRegistry."
+    Invoke-Checked { az provider register --namespace Microsoft.ManagedIdentity --wait } "Failed to register Microsoft.ManagedIdentity."
 
     $existingGroup = (az group exists --name $ResourceGroupName --output tsv).Trim()
     if ($LASTEXITCODE -ne 0) {
@@ -160,7 +161,7 @@ try {
         "--name", "sinwo-infra",
         "--resource-group", $ResourceGroupName,
         "--template-file", $template,
-        "--parameters", "location=$Location", "acrName=$AcrName", "deployStamp=$(Get-Date -Format 'yyyyMMddHHmmss')",
+        "--parameters", "location=$Location", "acrName=$AcrName", "githubRepo=$GitHubRepo", "deployStamp=$(Get-Date -Format 'yyyyMMddHHmmss')",
         "--query", "properties.outputs",
         "--output", "json"
     )
@@ -213,6 +214,9 @@ try {
     Set-RepoVariable "AZURE_LOCATION" $Location
     Set-RepoVariable "IMAGE_REPOSITORY_BACKEND" $outputs.backendRepository.value
     Set-RepoVariable "IMAGE_REPOSITORY_FRONTEND" $outputs.frontendRepository.value
+    Set-RepoVariable "AZURE_CLIENT_ID" $outputs.deployIdentityClientId.value
+    Set-RepoVariable "AZURE_TENANT_ID" $outputs.tenantId.value
+    Set-RepoVariable "AZURE_SUBSCRIPTION_ID" $account.id
 
     Write-Host "Creating GitHub environments..."
     '{"wait_timer":0}' | gh api --method PUT "repos/$GitHubRepo/environments/dev" --input - --silent
@@ -248,6 +252,24 @@ try {
     Set-EnvVariable "prod" "CONTAINER_APP_BACKEND" $outputs.backendProdName.value
     Set-EnvVariable "prod" "CONTAINER_APP_FRONTEND" $outputs.frontendProdName.value
 
+    Write-Host "Configuring branch protection on main..."
+    $protection = @{
+        required_status_checks        = @{
+            strict   = $true
+            contexts = @("ci-status")
+        }
+        enforce_admins                = $false
+        required_pull_request_reviews = $null
+        restrictions                  = $null
+    } | ConvertTo-Json -Depth 5 -Compress
+    $protection | gh api --method PUT "repos/$GitHubRepo/branches/main/protection" --input - --silent
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "Could not require the ci-status check on main. A private repository on the free plan cannot use branch protection."
+    }
+    else {
+        Write-Host "main now requires the ci-status check."
+    }
+
     Write-Host ""
     Write-Host "Infrastructure is ready."
     Write-Host "Resource group: $ResourceGroupName ($Location)"
@@ -258,7 +280,8 @@ try {
     Write-Host "PROD backend:   $($outputs.backendProdUrl.value)"
     Write-Host ""
     Write-Host "ACR Basic is the standing cost. The four apps use minReplicas 0, so they do not bill while idle."
-    Write-Host "Revisions stay unhealthy until the first image push, because the registry is still empty."
+    Write-Host "GitHub Actions signs in with the deploy identity. ACR_USERNAME and ACR_PASSWORD remain only as a manual fallback."
+    Write-Host "This run points each app at its *-latest tag and sets APP_VERSION to that tag. The tag still refers to the last image that was pushed."
     if (-not $ProdReviewer) {
         Write-Host "The prod environment has no required reviewer. Re-run with -ProdReviewer <github-user> to add one."
     }

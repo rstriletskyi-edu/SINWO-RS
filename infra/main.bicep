@@ -1,6 +1,6 @@
 targetScope = 'resourceGroup'
 
-@description('Region for every resource. ACR webhooks must be created in the registry region.')
+@description('Region for every resource. The registry and Container Apps environment must share it.')
 param location string
 
 @description('Globally unique ACR name, 5-50 alphanumeric characters.')
@@ -19,6 +19,18 @@ param logAnalyticsName string = 'log-sinwo-cicd'
 
 @description('Built-in AcrPull role definition ID.')
 param acrPullRoleId string = '7f951dda-4ed3-4680-a7ca-43fe172d538d'
+
+@description('Built-in AcrPush role definition ID.')
+param acrPushRoleId string = '8311e382-0749-4cb8-b61a-304f252e45ec'
+
+@description('Built-in Contributor role definition ID.')
+param contributorRoleId string = 'b24988ac-6180-42a0-ab88-20f7382dd24c'
+
+@description('GitHub repository that may deploy, as owner/name.')
+param githubRepo string
+
+@description('User-assigned identity GitHub Actions uses for OIDC login.')
+param deployIdentityName string = 'id-sinwo-github-deploy'
 
 @description('Maximum replicas for each app. Minimum is fixed at 0.')
 param maxReplicas int = 1
@@ -64,6 +76,58 @@ resource acrPull 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   properties: {
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', acrPullRoleId)
     principalId: pullIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+resource deployIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
+  name: deployIdentityName
+  location: location
+  tags: projectTag
+}
+
+resource githubDevCredential 'Microsoft.ManagedIdentity/userAssignedIdentities/federatedIdentityCredentials@2023-01-31' = {
+  parent: deployIdentity
+  name: 'github-dev'
+  properties: {
+    issuer: 'https://token.actions.githubusercontent.com'
+    subject: 'repo:${githubRepo}:environment:dev'
+    audiences: [
+      'api://AzureADTokenExchange'
+    ]
+  }
+}
+
+resource githubProdCredential 'Microsoft.ManagedIdentity/userAssignedIdentities/federatedIdentityCredentials@2023-01-31' = {
+  parent: deployIdentity
+  name: 'github-prod'
+  properties: {
+    issuer: 'https://token.actions.githubusercontent.com'
+    subject: 'repo:${githubRepo}:environment:prod'
+    audiences: [
+      'api://AzureADTokenExchange'
+    ]
+  }
+  dependsOn: [
+    githubDevCredential
+  ]
+}
+
+resource githubContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(resourceGroup().id, deployIdentity.id, contributorRoleId)
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', contributorRoleId)
+    principalId: deployIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+resource acrPush 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(registry.id, deployIdentity.id, acrPushRoleId)
+  scope: registry
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', acrPushRoleId)
+    principalId: deployIdentity.properties.principalId
     principalType: 'ServicePrincipal'
   }
 }
@@ -219,3 +283,5 @@ output backendDevUrl string = backendDev.outputs.url
 output frontendDevUrl string = frontendDev.outputs.url
 output backendProdUrl string = backendProd.outputs.url
 output frontendProdUrl string = frontendProd.outputs.url
+output deployIdentityClientId string = deployIdentity.properties.clientId
+output tenantId string = tenant().tenantId
