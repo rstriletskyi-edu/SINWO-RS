@@ -7,7 +7,7 @@ param location string
 @description('Resource ID of the shared Container Apps environment.')
 param environmentId string
 
-@description('Resource ID of the user-assigned identity that pulls from ACR.')
+@description('Resource ID of the user-assigned identity that has AcrPull on the registry.')
 param identityId string
 
 @description('ACR login server, for example acrsinwo.azurecr.io.')
@@ -15,6 +15,9 @@ param registryLoginServer string
 
 @description('Full image reference, including the registry and tag.')
 param image string
+
+@description('Value that changes on every deployment so Container Apps creates a revision and pulls the tag again.')
+param deployStamp string
 
 @description('Container name inside the app.')
 param containerName string
@@ -34,7 +37,7 @@ param maxReplicas int
 @description('Tags applied to the Container App.')
 param tags object
 
-resource app 'Microsoft.App/containerApps@2024-03-01' = {
+resource app 'Microsoft.App/containerApps@2026-07-01' = {
   name: name
   location: location
   tags: tags
@@ -46,6 +49,7 @@ resource app 'Microsoft.App/containerApps@2024-03-01' = {
   }
   properties: {
     environmentId: environmentId
+    workloadProfileName: 'Consumption'
     configuration: {
       activeRevisionsMode: 'Single'
       ingress: {
@@ -72,7 +76,9 @@ resource app 'Microsoft.App/containerApps@2024-03-01' = {
         {
           name: containerName
           image: image
-          env: containerEnv
+          env: concat(containerEnv, [
+            { name: 'DEPLOY_STAMP', value: deployStamp }
+          ])
           resources: {
             cpu: json('0.25')
             memory: '0.5Gi'

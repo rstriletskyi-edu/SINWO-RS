@@ -80,11 +80,22 @@ resource logAnalytics 'Microsoft.OperationalInsights/workspaces@2023-09-01' = {
   }
 }
 
-resource environment 'Microsoft.App/managedEnvironments@2024-03-01' = {
+param deployStamp string
+
+// Without an explicit mode, Azure creates an Express environment, which cannot pull
+// private ACR images through a managed identity.
+resource environment 'Microsoft.App/managedEnvironments@2026-07-01' = {
   name: environmentName
   location: location
   tags: projectTag
   properties: {
+    environmentMode: 'WorkloadProfiles'
+    workloadProfiles: [
+      {
+        name: 'Consumption'
+        workloadProfileType: 'Consumption'
+      }
+    ]
     appLogsConfiguration: {
       destination: 'log-analytics'
       logAnalyticsConfiguration: {
@@ -103,6 +114,7 @@ module backendDev 'modules/container-app.bicep' = {
     environmentId: environment.id
     identityId: pullIdentity.id
     registryLoginServer: registry.properties.loginServer
+    deployStamp: deployStamp
     image: '${registry.properties.loginServer}/${backendRepository}:${devTag}'
     containerName: 'backend'
     targetPort: 8000
@@ -127,6 +139,7 @@ module frontendDev 'modules/container-app.bicep' = {
     environmentId: environment.id
     identityId: pullIdentity.id
     registryLoginServer: registry.properties.loginServer
+    deployStamp: deployStamp
     image: '${registry.properties.loginServer}/${frontendRepository}:${devTag}'
     containerName: 'frontend'
     targetPort: 80
@@ -150,6 +163,7 @@ module backendProd 'modules/container-app.bicep' = {
     environmentId: environment.id
     identityId: pullIdentity.id
     registryLoginServer: registry.properties.loginServer
+    deployStamp: deployStamp
     image: '${registry.properties.loginServer}/${backendRepository}:${prodTag}'
     containerName: 'backend'
     targetPort: 8000
@@ -174,6 +188,7 @@ module frontendProd 'modules/container-app.bicep' = {
     environmentId: environment.id
     identityId: pullIdentity.id
     registryLoginServer: registry.properties.loginServer
+    deployStamp: deployStamp
     image: '${registry.properties.loginServer}/${frontendRepository}:${prodTag}'
     containerName: 'frontend'
     targetPort: 80
@@ -188,53 +203,6 @@ module frontendProd 'modules/container-app.bicep' = {
     acrPull
   ]
 }
-
-// Pushing :dev-latest or :prod-latest notifies Container Apps, which rolls a new revision.
-// Scoped webhooks ignore the immutable sha tags the pipeline also pushes.
-var continuousDeployment = [
-  {
-    webhookName: 'cdcabackenddev'
-    appName: backendDevName
-    scope: '${backendRepository}:${devTag}'
-  }
-  {
-    webhookName: 'cdcafrontenddev'
-    appName: frontendDevName
-    scope: '${frontendRepository}:${devTag}'
-  }
-  {
-    webhookName: 'cdcabackendprod'
-    appName: backendProdName
-    scope: '${backendRepository}:${prodTag}'
-  }
-  {
-    webhookName: 'cdcafrontendprod'
-    appName: frontendProdName
-    scope: '${frontendRepository}:${prodTag}'
-  }
-]
-
-resource webhooks 'Microsoft.ContainerRegistry/registries/webhooks@2023-07-01' = [for target in continuousDeployment: {
-  parent: registry
-  name: target.webhookName
-  location: location
-  properties: {
-    actions: [
-      'push'
-    ]
-    scope: target.scope
-    status: 'enabled'
-    // The URI is the Container Apps callback for this app. It contains no credential.
-    #disable-next-line use-secure-value-for-secure-inputs
-    serviceUri: 'https://${location}.azurecontainerapps.dev/subscriptions/${subscription().subscriptionId}/resourceGroups/${resourceGroup().name}/providers/Microsoft.App/containerApps/${target.appName}?api-version=2024-03-01'
-  }
-  dependsOn: [
-    backendDev
-    frontendDev
-    backendProd
-    frontendProd
-  ]
-}]
 
 output acrName string = registry.name
 output acrLoginServer string = registry.properties.loginServer

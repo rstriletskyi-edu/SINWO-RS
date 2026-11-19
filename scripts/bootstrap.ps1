@@ -14,7 +14,7 @@
   Resource group to create or update. Default: rg-sinwo-cicd.
 
 .PARAMETER Location
-  Region used when the resource group is created. Default: westeurope.
+  Region used when the resource group is created. Default: germanywestcentral.
   An existing group keeps its current region.
 
 .PARAMETER AcrName
@@ -39,7 +39,7 @@
 [CmdletBinding()]
 param(
     [string]$ResourceGroupName = "rg-sinwo-cicd",
-    [string]$Location = "westeurope",
+    [string]$Location = "germanywestcentral",
     [string]$AcrName,
     [string]$Subscription,
     [string]$GitHubRepo,
@@ -160,7 +160,7 @@ try {
         "--name", "sinwo-infra",
         "--resource-group", $ResourceGroupName,
         "--template-file", $template,
-        "--parameters", "location=$Location", "acrName=$AcrName",
+        "--parameters", "location=$Location", "acrName=$AcrName", "deployStamp=$(Get-Date -Format 'yyyyMMddHHmmss')",
         "--query", "properties.outputs",
         "--output", "json"
     )
