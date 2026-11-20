@@ -4,11 +4,14 @@
   Creates the SINWO Azure footprint and the GitHub dev and prod environments.
 
 .DESCRIPTION
-  Deploys infra/main.bicep into rg-sinwo-cicd, then stores GitHub environment
-  variables and the OIDC identifiers the workflow uses. ACR admin credentials
-  stay as repository secrets for a manual fallback. The script does not print
-  the registry password. Rerunning resets each app to its *-latest image tag
-  and APP_VERSION=*-latest. Those tags still point at the last pushed image.
+  Deploys infra/main.bicep into rg-sinwo-cicd in two passes: shared resources
+  first, then the four Container Apps once the *-latest image tags exist. It
+  seeds those tags on the first run, then stores the GitHub environment
+  variables and OIDC identifiers the workflows use. No password or secret is
+  stored in GitHub: the registry admin user is disabled, Container Apps pull
+  with a managed identity, and GitHub Actions signs in through a federated
+  credential. Rerunning resets each app to its *-latest image tag and
+  APP_VERSION=*-latest. Those tags still point at the last pushed image.
 
 .PARAMETER ResourceGroupName
   Resource group to create or update. Default: rg-sinwo-cicd.
@@ -59,6 +62,20 @@ function Invoke-Checked {
     & $Command
     if ($LASTEXITCODE -ne 0) {
         throw $FailureMessage
+    }
+}
+
+function Invoke-Quiet {
+    param([Parameter(Mandatory = $true)][scriptblock]$Command)
+
+    # Windows PowerShell 5 turns native stderr into a terminating error under "Stop".
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        & $Command 2>$null
+    }
+    finally {
+        $ErrorActionPreference = $previous
     }
 }
 
@@ -128,7 +145,7 @@ try {
             $Location = $groupLocation
         }
         if (-not $AcrName) {
-            $previousAcr = az deployment group show --resource-group $ResourceGroupName --name sinwo-infra --query properties.outputs.acrName.value --output tsv 2>$null
+            $previousAcr = Invoke-Quiet { az deployment group show --resource-group $ResourceGroupName --name sinwo-infra --query properties.outputs.acrName.value --output tsv }
             if ($LASTEXITCODE -eq 0 -and $previousAcr) {
                 $AcrName = $previousAcr.Trim()
             }
@@ -155,27 +172,34 @@ try {
         $AcrName = "acrsinwo$suffix"
     }
 
-    Write-Host "Deploying infra/main.bicep (registry $AcrName, region $Location)..."
-    $deployArgs = @(
-        "deployment", "group", "create",
-        "--name", "sinwo-infra",
-        "--resource-group", $ResourceGroupName,
-        "--template-file", $template,
-        "--parameters", "location=$Location", "acrName=$AcrName", "githubRepo=$GitHubRepo", "deployStamp=$(Get-Date -Format 'yyyyMMddHHmmss')",
-        "--query", "properties.outputs",
-        "--output", "json"
-    )
-    $deploymentJson = az @deployArgs
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "First deployment failed. Retrying once in case the managed identity was not replicated yet..."
-        Start-Sleep -Seconds 20
-        $deploymentJson = az @deployArgs
+    $deployStamp = Get-Date -Format "yyyyMMddHHmmss"
+    function Invoke-InfraDeployment {
+        param([bool]$DeployApps)
+
+        $deployArgs = @(
+            "deployment", "group", "create",
+            "--name", "sinwo-infra",
+            "--resource-group", $ResourceGroupName,
+            "--template-file", $template,
+            "--parameters", "location=$Location", "acrName=$AcrName", "githubRepo=$GitHubRepo",
+            "deployStamp=$deployStamp", "deployApps=$($DeployApps.ToString().ToLower())",
+            "--query", "properties.outputs",
+            "--output", "json"
+        )
+        $json = az @deployArgs
         if ($LASTEXITCODE -ne 0) {
-            throw "Bicep deployment failed."
+            Write-Host "Deployment failed. Retrying once in case a new identity has not replicated yet..."
+            Start-Sleep -Seconds 30
+            $json = az @deployArgs
+            if ($LASTEXITCODE -ne 0) {
+                throw "Bicep deployment failed."
+            }
         }
+        return ($json | ConvertFrom-Json)
     }
 
-    $outputs = $deploymentJson | ConvertFrom-Json
+    Write-Host "Deploying shared infrastructure (registry $AcrName, region $Location)..."
+    $outputs = Invoke-InfraDeployment -DeployApps $false
     $resolvedAcrName = $outputs.acrName.value
     $loginServer = $outputs.acrLoginServer.value
 
@@ -183,18 +207,47 @@ try {
     Invoke-Checked { az acr update --name $resolvedAcrName --role-assignment-mode rbac --output none } "Could not set the registry role assignment mode to rbac."
     Invoke-Checked { az acr config authentication-as-arm update --registry $resolvedAcrName --status enabled --output none } "Could not enable ARM audience tokens on the registry. Managed identity image pull needs that policy."
 
-    Write-Host "Reading ACR admin credentials..."
-    $credentials = az acr credential show --name $resolvedAcrName --query "{username:username,password:passwords[0].value}" --output json | ConvertFrom-Json
-    if ($LASTEXITCODE -ne 0 -or -not $credentials.password) {
-        throw "Could not read ACR admin credentials. Confirm adminUserEnabled is true on $resolvedAcrName."
+    foreach ($image in @(
+            @{ Repository = $outputs.backendRepository.value; Context = "backend" },
+            @{ Repository = $outputs.frontendRepository.value; Context = "frontend" }
+        )) {
+        $tags = Invoke-Quiet { az acr repository show-tags --name $resolvedAcrName --repository $image.Repository --output tsv }
+        if ($LASTEXITCODE -eq 0 -and $tags -contains "dev-latest" -and $tags -contains "prod-latest") {
+            continue
+        }
+
+        Write-Host "Seeding $($image.Repository):dev-latest and :prod-latest so the apps have an image to start..."
+        $useDocker = $false
+        if (Get-Command docker -ErrorAction SilentlyContinue) {
+            Invoke-Quiet { docker info --format "{{.ServerVersion}}" } | Out-Null
+            $useDocker = ($LASTEXITCODE -eq 0)
+        }
+
+        if ($useDocker) {
+            Invoke-Checked { az acr login --name $resolvedAcrName } "Could not sign in to $resolvedAcrName with your Azure account."
+            Invoke-Checked {
+                docker buildx build --platform linux/amd64 --provenance=false --sbom=false --target prod `
+                    -t "$loginServer/$($image.Repository):dev-latest" -t "$loginServer/$($image.Repository):prod-latest" `
+                    --push $image.Context
+            } "Docker build of $($image.Context) failed."
+        }
+        else {
+            Write-Host "Docker is not running. Building in the registry with az acr build instead."
+            Invoke-Checked {
+                az acr build --registry $resolvedAcrName --platform linux/amd64 --target prod `
+                    --image "$($image.Repository):dev-latest" --image "$($image.Repository):prod-latest" `
+                    $image.Context
+            } "az acr build of $($image.Context) failed. Start Docker Desktop and rerun the script."
+        }
     }
 
-    Write-Host "Storing repository secrets and variables..."
-    gh secret set ACR_USERNAME --repo $GitHubRepo --body $credentials.username
-    if ($LASTEXITCODE -ne 0) { throw "Failed to set ACR_USERNAME." }
-    gh secret set ACR_PASSWORD --repo $GitHubRepo --body $credentials.password
-    if ($LASTEXITCODE -ne 0) { throw "Failed to set ACR_PASSWORD." }
-    $credentials = $null
+    Write-Host "Deploying the four Container Apps..."
+    $outputs = Invoke-InfraDeployment -DeployApps $true
+
+    Write-Host "Removing registry passwords from GitHub..."
+    foreach ($secret in "ACR_USERNAME", "ACR_PASSWORD") {
+        Invoke-Quiet { gh secret delete $secret --repo $GitHubRepo } | Out-Null
+    }
 
     function Set-RepoVariable {
         param([string]$Name, [string]$Value)
@@ -280,7 +333,7 @@ try {
     Write-Host "PROD backend:   $($outputs.backendProdUrl.value)"
     Write-Host ""
     Write-Host "ACR Basic is the standing cost. The four apps use minReplicas 0, so they do not bill while idle."
-    Write-Host "GitHub Actions signs in with the deploy identity. ACR_USERNAME and ACR_PASSWORD remain only as a manual fallback."
+    Write-Host "GitHub Actions signs in with the deploy identity through OIDC. No registry password is stored in GitHub."
     Write-Host "This run points each app at its *-latest tag and sets APP_VERSION to that tag. The tag still refers to the last image that was pushed."
     if (-not $ProdReviewer) {
         Write-Host "The prod environment has no required reviewer. Re-run with -ProdReviewer <github-user> to add one."

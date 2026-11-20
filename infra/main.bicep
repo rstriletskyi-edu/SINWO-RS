@@ -63,9 +63,7 @@ resource registry 'Microsoft.ContainerRegistry/registries@2023-07-01' = {
     name: 'Basic'
   }
   properties: {
-    // Phase 1: GitHub Actions logs in with the admin user because the university tenant
-    // blocks Entra app registrations. Phase 2 turns this off and uses OIDC.
-    adminUserEnabled: true
+    adminUserEnabled: false
     publicNetworkAccess: 'Enabled'
   }
 }
@@ -170,7 +168,10 @@ resource environment 'Microsoft.App/managedEnvironments@2026-07-01' = {
   }
 }
 
-module backendDev 'modules/container-app.bicep' = {
+@description('Create the four Container Apps. Leave false until the *-latest image tags exist in the registry.')
+param deployApps bool = true
+
+module backendDev 'modules/container-app.bicep' = if (deployApps) {
   name: 'ca-backend-dev'
   params: {
     name: backendDevName
@@ -195,7 +196,7 @@ module backendDev 'modules/container-app.bicep' = {
   ]
 }
 
-module frontendDev 'modules/container-app.bicep' = {
+module frontendDev 'modules/container-app.bicep' = if (deployApps) {
   name: 'ca-frontend-dev'
   params: {
     name: frontendDevName
@@ -211,7 +212,7 @@ module frontendDev 'modules/container-app.bicep' = {
     maxReplicas: maxReplicas
     tags: union(projectTag, { environment: 'DEV' })
     containerEnv: [
-      { name: 'BACKEND_URL', value: backendDev.outputs.url }
+      { name: 'BACKEND_URL', value: backendDev!.outputs.url }
     ]
   }
   dependsOn: [
@@ -219,7 +220,7 @@ module frontendDev 'modules/container-app.bicep' = {
   ]
 }
 
-module backendProd 'modules/container-app.bicep' = {
+module backendProd 'modules/container-app.bicep' = if (deployApps) {
   name: 'ca-backend-prod'
   params: {
     name: backendProdName
@@ -244,7 +245,7 @@ module backendProd 'modules/container-app.bicep' = {
   ]
 }
 
-module frontendProd 'modules/container-app.bicep' = {
+module frontendProd 'modules/container-app.bicep' = if (deployApps) {
   name: 'ca-frontend-prod'
   params: {
     name: frontendProdName
@@ -260,7 +261,7 @@ module frontendProd 'modules/container-app.bicep' = {
     maxReplicas: maxReplicas
     tags: union(projectTag, { environment: 'PROD' })
     containerEnv: [
-      { name: 'BACKEND_URL', value: backendProd.outputs.url }
+      { name: 'BACKEND_URL', value: backendProd!.outputs.url }
     ]
   }
   dependsOn: [
@@ -279,9 +280,9 @@ output backendDevName string = backendDevName
 output frontendDevName string = frontendDevName
 output backendProdName string = backendProdName
 output frontendProdName string = frontendProdName
-output backendDevUrl string = backendDev.outputs.url
-output frontendDevUrl string = frontendDev.outputs.url
-output backendProdUrl string = backendProd.outputs.url
-output frontendProdUrl string = frontendProd.outputs.url
+output backendDevUrl string = deployApps ? backendDev!.outputs.url : ''
+output frontendDevUrl string = deployApps ? frontendDev!.outputs.url : ''
+output backendProdUrl string = deployApps ? backendProd!.outputs.url : ''
+output frontendProdUrl string = deployApps ? frontendProd!.outputs.url : ''
 output deployIdentityClientId string = deployIdentity.properties.clientId
 output tenantId string = tenant().tenantId
