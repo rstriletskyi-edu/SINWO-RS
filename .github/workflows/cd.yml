@@ -1,0 +1,226 @@
+name: CD
+
+# Called from CI once ci-status succeeds. github.ref is the push or tag that CI tested.
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: cd-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      backend: ${{ steps.out.outputs.backend }}
+      frontend: ${{ steps.out.outputs.frontend }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dorny/paths-filter@v3
+        id: filter
+        if: github.ref_type != 'tag'
+        with:
+          filters: |
+            backend:
+              - 'backend/**'
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/cd.yml'
+            frontend:
+              - 'frontend/**'
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/cd.yml'
+      - id: out
+        run: |
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            echo "backend=true" >> "$GITHUB_OUTPUT"
+            echo "frontend=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "backend=${{ steps.filter.outputs.backend }}" >> "$GITHUB_OUTPUT"
+            echo "frontend=${{ steps.filter.outputs.frontend }}" >> "$GITHUB_OUTPUT"
+          fi
+
+  deploy-dev-backend:
+    needs: changes
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.changes.outputs.backend == 'true'
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - uses: actions/checkout@v4
+      - id: sha
+        run: echo "short=${GITHUB_SHA::0:7}" >> "$GITHUB_OUTPUT"
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - run: az acr login --name "${{ vars.ACR_NAME }}"
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: backend
+          target: prod
+          provenance: false
+          sbom: false
+          tags: |
+            ${{ vars.ACR_LOGIN_SERVER }}/${{ vars.IMAGE_REPOSITORY_BACKEND }}:dev-${{ steps.sha.outputs.short }}
+            ${{ vars.ACR_LOGIN_SERVER }}/${{ vars.IMAGE_REPOSITORY_BACKEND }}:dev-latest
+          cache-from: type=registry,ref=${{ vars.ACR_LOGIN_SERVER }}/${{ vars.IMAGE_REPOSITORY_BACKEND }}:buildcache
+          cache-to: type=registry,ref=${{ vars.ACR_LOGIN_SERVER }}/${{ vars.IMAGE_REPOSITORY_BACKEND }}:buildcache,mode=max
+          outputs: type=image,push=true,oci-mediatypes=false
+      - name: Roll the DEV backend
+        run: |
+          az containerapp update \
+            --name "${{ vars.CONTAINER_APP_BACKEND }}" \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --image "${{ vars.ACR_LOGIN_SERVER }}/${{ vars.IMAGE_REPOSITORY_BACKEND }}:dev-${{ steps.sha.outputs.short }}" \
+            --set-env-vars "APP_VERSION=dev-${{ steps.sha.outputs.short }}" \
+            --output none
+
+  deploy-dev-frontend:
+    needs: changes
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.changes.outputs.frontend == 'true'
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - uses: actions/checkout@v4
+      - id: sha
+        run: echo "short=${GITHUB_SHA::0:7}" >> "$GITHUB_OUTPUT"
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - run: az acr login --name "${{ vars.ACR_NAME }}"
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: frontend
+          target: prod
+          provenance: false
+          sbom: false
+          tags: |
+            ${{ vars.ACR_LOGIN_SERVER }}/${{ vars.IMAGE_REPOSITORY_FRONTEND }}:dev-${{ steps.sha.outputs.short }}
+            ${{ vars.ACR_LOGIN_SERVER }}/${{ vars.IMAGE_REPOSITORY_FRONTEND }}:dev-latest
+          cache-from: type=registry,ref=${{ vars.ACR_LOGIN_SERVER }}/${{ vars.IMAGE_REPOSITORY_FRONTEND }}:buildcache
+          cache-to: type=registry,ref=${{ vars.ACR_LOGIN_SERVER }}/${{ vars.IMAGE_REPOSITORY_FRONTEND }}:buildcache,mode=max
+          outputs: type=image,push=true,oci-mediatypes=false
+      - name: Roll the DEV frontend
+        run: |
+          az containerapp update \
+            --name "${{ vars.CONTAINER_APP_FRONTEND }}" \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --image "${{ vars.ACR_LOGIN_SERVER }}/${{ vars.IMAGE_REPOSITORY_FRONTEND }}:dev-${{ steps.sha.outputs.short }}" \
+            --output none
+
+  smoke-dev:
+    needs: [changes, deploy-dev-backend, deploy-dev-frontend]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && !failure() && !cancelled()
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - name: Probe the DEV backend
+        if: needs.changes.outputs.backend == 'true'
+        run: |
+          url="${{ vars.BACKEND_URL }}/api/health"
+          deadline=$((SECONDS + 180))
+          until curl --fail --silent --show-error --max-time 20 "$url"; do
+            if (( SECONDS >= deadline )); then
+              echo "DEV backend health check timed out"
+              exit 1
+            fi
+            sleep 10
+          done
+      - name: Probe the DEV frontend
+        if: needs.changes.outputs.frontend == 'true'
+        run: |
+          url="${{ vars.FRONTEND_URL }}/api/health"
+          deadline=$((SECONDS + 180))
+          until curl --fail --silent --show-error --max-time 20 "$url"; do
+            if (( SECONDS >= deadline )); then
+              echo "DEV frontend health check timed out"
+              exit 1
+            fi
+            sleep 10
+          done
+
+  deploy-prod:
+    needs: changes
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment: prod
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - run: az acr login --name "${{ vars.ACR_NAME }}"
+      - uses: docker/setup-buildx-action@v3
+      - name: Push the backend release
+        uses: docker/build-push-action@v6
+        with:
+          context: backend
+          target: prod
+          provenance: false
+          sbom: false
+          tags: |
+            ${{ vars.ACR_LOGIN_SERVER }}/${{ vars.IMAGE_REPOSITORY_BACKEND }}:${{ github.ref_name }}
+            ${{ vars.ACR_LOGIN_SERVER }}/${{ vars.IMAGE_REPOSITORY_BACKEND }}:prod-latest
+          cache-from: type=registry,ref=${{ vars.ACR_LOGIN_SERVER }}/${{ vars.IMAGE_REPOSITORY_BACKEND }}:buildcache
+          cache-to: type=registry,ref=${{ vars.ACR_LOGIN_SERVER }}/${{ vars.IMAGE_REPOSITORY_BACKEND }}:buildcache,mode=max
+          outputs: type=image,push=true,oci-mediatypes=false
+      - name: Push the frontend release
+        uses: docker/build-push-action@v6
+        with:
+          context: frontend
+          target: prod
+          provenance: false
+          sbom: false
+          tags: |
+            ${{ vars.ACR_LOGIN_SERVER }}/${{ vars.IMAGE_REPOSITORY_FRONTEND }}:${{ github.ref_name }}
+            ${{ vars.ACR_LOGIN_SERVER }}/${{ vars.IMAGE_REPOSITORY_FRONTEND }}:prod-latest
+          cache-from: type=registry,ref=${{ vars.ACR_LOGIN_SERVER }}/${{ vars.IMAGE_REPOSITORY_FRONTEND }}:buildcache
+          cache-to: type=registry,ref=${{ vars.ACR_LOGIN_SERVER }}/${{ vars.IMAGE_REPOSITORY_FRONTEND }}:buildcache,mode=max
+          outputs: type=image,push=true,oci-mediatypes=false
+      - name: Roll PROD
+        run: |
+          az containerapp update \
+            --name "${{ vars.CONTAINER_APP_BACKEND }}" \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --image "${{ vars.ACR_LOGIN_SERVER }}/${{ vars.IMAGE_REPOSITORY_BACKEND }}:${{ github.ref_name }}" \
+            --set-env-vars "APP_VERSION=${{ github.ref_name }}" \
+            --output none
+          az containerapp update \
+            --name "${{ vars.CONTAINER_APP_FRONTEND }}" \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --image "${{ vars.ACR_LOGIN_SERVER }}/${{ vars.IMAGE_REPOSITORY_FRONTEND }}:${{ github.ref_name }}" \
+            --output none
+
+  verify-prod:
+    needs: deploy-prod
+    if: startsWith(github.ref, 'refs/tags/v') && needs.deploy-prod.result == 'success'
+    runs-on: ubuntu-latest
+    environment: prod
+    steps:
+      - name: Probe PROD
+        run: |
+          probe() {
+            local url="$1"
+            local deadline=$((SECONDS + 180))
+            until curl --fail --silent --show-error --max-time 20 "$url"; do
+              if (( SECONDS >= deadline )); then
+                echo "Timed out waiting for $url"
+                return 1
+              fi
+              sleep 10
+            done
+          }
+          probe "${{ vars.BACKEND_URL }}/api/health"
+          probe "${{ vars.FRONTEND_URL }}/api/health"
