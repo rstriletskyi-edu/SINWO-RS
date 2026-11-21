@@ -55,7 +55,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - id: sha
-        run: echo "short=${GITHUB_SHA::0:7}" >> "$GITHUB_OUTPUT"
+        run: echo "short=${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
       - uses: azure/login@v2
         with:
           client-id: ${{ vars.AZURE_CLIENT_ID }}
@@ -92,7 +92,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - id: sha
-        run: echo "short=${GITHUB_SHA::0:7}" >> "$GITHUB_OUTPUT"
+        run: echo "short=${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
       - uses: azure/login@v2
         with:
           client-id: ${{ vars.AZURE_CLIENT_ID }}
