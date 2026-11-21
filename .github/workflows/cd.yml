@@ -1,7 +1,9 @@
 name: CD
 
-# Called from CI once ci-status succeeds. github.ref is the push or tag that CI tested.
+# Push to main deploys dev. A version tag deploys prod only after CI calls this workflow.
 on:
+  push:
+    branches: [main]
   workflow_call:
 
 permissions:

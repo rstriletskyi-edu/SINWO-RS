@@ -123,6 +123,11 @@ try {
         }
     }
     Write-Host "GitHub repository: $GitHubRepo"
+    $repoIds = gh api "repos/$GitHubRepo" --jq "{ownerId: .owner.id, repoId: .id}" | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 0 -or -not $repoIds.ownerId -or -not $repoIds.repoId) {
+        throw "Could not read the GitHub owner id and repository id for '$GitHubRepo'."
+    }
+    Write-Host "GitHub OIDC subject ids: owner $($repoIds.ownerId), repository $($repoIds.repoId)"
 
     Write-Host "Registering resource providers..."
     Invoke-Checked { az provider register --namespace Microsoft.App --wait } "Failed to register Microsoft.App."
@@ -181,7 +186,7 @@ try {
             "--name", "sinwo-infra",
             "--resource-group", $ResourceGroupName,
             "--template-file", $template,
-            "--parameters", "location=$Location", "acrName=$AcrName", "githubRepo=$GitHubRepo",
+            "--parameters", "location=$Location", "acrName=$AcrName", "githubRepo=$GitHubRepo", "githubOwnerId=$($repoIds.ownerId)", "githubRepositoryId=$($repoIds.repoId)",
             "deployStamp=$deployStamp", "deployApps=$($DeployApps.ToString().ToLower())",
             "--query", "properties.outputs",
             "--output", "json"
