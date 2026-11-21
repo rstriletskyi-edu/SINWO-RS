@@ -29,6 +29,12 @@ param contributorRoleId string = 'b24988ac-6180-42a0-ab88-20f7382dd24c'
 @description('GitHub repository that may deploy, as owner/name.')
 param githubRepo string
 
+@description('Immutable GitHub owner id used in the Actions OIDC subject.')
+param githubOwnerId string
+
+@description('Immutable GitHub repository id used in the Actions OIDC subject.')
+param githubRepositoryId string
+
 @description('User-assigned identity GitHub Actions uses for OIDC login.')
 param deployIdentityName string = 'id-sinwo-github-deploy'
 
@@ -48,6 +54,9 @@ param frontendProdName string = 'ca-frontend-prod'
 var projectTag = {
   project: 'sinwo-cicd'
 }
+var githubOwner = split(githubRepo, '/')[0]
+var githubName = split(githubRepo, '/')[1]
+var githubSubjectRepo = 'repo:${githubOwner}@${githubOwnerId}/${githubName}@${githubRepositoryId}'
 
 resource pullIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
   name: pullIdentityName
@@ -89,7 +98,7 @@ resource githubDevCredential 'Microsoft.ManagedIdentity/userAssignedIdentities/f
   name: 'github-dev'
   properties: {
     issuer: 'https://token.actions.githubusercontent.com'
-    subject: 'repo:${githubRepo}:environment:dev'
+    subject: '${githubSubjectRepo}:environment:dev'
     audiences: [
       'api://AzureADTokenExchange'
     ]
@@ -101,7 +110,7 @@ resource githubProdCredential 'Microsoft.ManagedIdentity/userAssignedIdentities/
   name: 'github-prod'
   properties: {
     issuer: 'https://token.actions.githubusercontent.com'
-    subject: 'repo:${githubRepo}:environment:prod'
+    subject: '${githubSubjectRepo}:environment:prod'
     audiences: [
       'api://AzureADTokenExchange'
     ]
